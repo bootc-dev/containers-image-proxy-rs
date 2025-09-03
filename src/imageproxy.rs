@@ -773,6 +773,19 @@ mod tests {
     use cap_std_ext::cap_std::fs::Dir;
     use rustix::fs::{memfd_create, MemfdFlags};
 
+    /// Check if we have skopeo
+    fn check_skopeo() -> bool {
+        static HAVE_SKOPEO: OnceLock<bool> = OnceLock::new();
+        *HAVE_SKOPEO.get_or_init(|| {
+            Command::new("skopeo")
+                .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok()
+        })
+    }
+
     fn validate(c: Command, contains: &[&str], not_contains: &[&str]) {
         // Format via debug, because
         // https://doc.rust-lang.org/std/process/struct.Command.html#method.get_args
@@ -1010,5 +1023,22 @@ mod tests {
             }
             Err(other) => unreachable!("{other}"),
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "https://github.com/coreos/rpm-ostree/issues/5442"]
+    async fn test_open_optional() -> Result<()> {
+        if !check_skopeo() {
+            return Ok(());
+        }
+
+        let td = tempfile::tempdir()?;
+        let td = td.path().to_str().unwrap();
+        let proxy = ImageProxy::new().await?;
+        let imgpath = format!("oci-archive:{td}/some-nonexistent-image.ociarchive");
+        let img = proxy.open_image_optional(&imgpath).await.unwrap();
+        assert!(img.is_none());
+
+        Ok(())
     }
 }
