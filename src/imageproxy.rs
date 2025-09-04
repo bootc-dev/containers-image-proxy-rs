@@ -646,9 +646,12 @@ impl ImageProxy {
         tracing::debug!("fetching blob");
         let args: Vec<serde_json::Value> =
             vec![img.0.into(), digest.to_string().into(), size.into()];
-        let (bloblen, pipe): (u64, FinishPipe) =
+        // Note that size may be -1 here if e.g. the remote registry doesn't give a Content-Length
+        // for example.
+        // We have always validated the size later (in FinishPipe) so out of conservatism we
+        // just ignore the size here.
+        let (_bloblen, pipe): (serde_json::Number, FinishPipe) =
             self.impl_request_with_fds("GetBlob", args).await?;
-        let _: u64 = bloblen;
         let fd = tokio::fs::File::from_std(std::fs::File::from(pipe.datafd));
         let fd = tokio::io::BufReader::new(fd);
         let finish = Box::pin(self.finish_pipe(pipe.pipeid));
