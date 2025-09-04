@@ -686,20 +686,22 @@ impl ImageProxy {
 
     /// Fetch a blob identified by e.g. `sha256:<digest>`; does not perform
     /// any verification that the blob matches the digest. The size of the
-    /// blob and a pipe file descriptor are returned.
+    /// blob (if available) and a pipe file descriptor are returned.
     #[instrument]
     pub async fn get_raw_blob(
         &self,
         img: &OpenedImage,
         digest: &Digest,
     ) -> Result<(
-        u64,
+        Option<u64>,
         tokio::fs::File,
         impl Future<Output = std::result::Result<(), GetBlobError>> + Unpin + '_,
     )> {
         tracing::debug!("fetching blob");
         let args: Vec<serde_json::Value> = vec![img.0.into(), digest.to_string().into()];
-        let (bloblen, fds): (u64, DualFds) = self.impl_request_with_fds("GetRawBlob", args).await?;
+        let (bloblen, fds): (i64, DualFds) = self.impl_request_with_fds("GetRawBlob", args).await?;
+        // See the GetBlob case, we have a best-effort attempt to return the size, but it might not be known
+        let bloblen = u64::try_from(bloblen).ok();
         let fd = tokio::fs::File::from_std(std::fs::File::from(fds.datafd));
         let err = Self::read_blob_error(fds.errfd).boxed();
         Ok((bloblen, fd, err))
