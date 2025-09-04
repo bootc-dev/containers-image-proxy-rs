@@ -7,9 +7,10 @@ use oci_spec::image::{Digest, ImageManifest};
 use tokio::io::AsyncReadExt;
 
 #[derive(clap::Parser, Debug)]
-struct GetMetadataOpts {
-    /// The skopeo-style transport:image reference
-    reference: String,
+struct CommonOpts {
+    /// Emit debugging to stderr
+    #[clap(long)]
+    debug: bool,
 
     /// Disable TLS verification
     #[clap(long)]
@@ -17,7 +18,19 @@ struct GetMetadataOpts {
 }
 
 #[derive(clap::Parser, Debug)]
+struct GetMetadataOpts {
+    #[clap(flatten)]
+    common: CommonOpts,
+
+    /// The skopeo-style transport:image reference
+    reference: String,
+}
+
+#[derive(clap::Parser, Debug)]
 struct GetBlobOpts {
+    #[clap(flatten)]
+    common: CommonOpts,
+
     /// The skopeo-style transport:image reference
     reference: String,
 
@@ -54,9 +67,12 @@ struct Metadata {
     manifest: ImageManifest,
 }
 
-impl GetMetadataOpts {
-    fn proxy_opts(&self) -> containers_image_proxy::ImageProxyConfig {
+impl CommonOpts {
+    fn to_config(self) -> ImageProxyConfig {
         let mut r = ImageProxyConfig::default();
+        if self.debug {
+            r.debug = true;
+        }
         if self.insecure {
             r.insecure_skip_tls_verification = Some(true)
         }
@@ -65,7 +81,7 @@ impl GetMetadataOpts {
 }
 
 async fn get_metadata(o: GetMetadataOpts) -> Result<()> {
-    let config = o.proxy_opts();
+    let config = o.common.to_config();
     let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
     let img = proxy.open_image(&o.reference).await?;
     let (digest, manifest) = proxy.fetch_manifest(&img).await?;
@@ -75,7 +91,8 @@ async fn get_metadata(o: GetMetadataOpts) -> Result<()> {
 }
 
 async fn get_blob(o: GetBlobOpts) -> Result<()> {
-    let proxy = containers_image_proxy::ImageProxy::new().await?;
+    let config = o.common.to_config();
+    let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
     let img = proxy.open_image(&o.reference).await?;
     let (mut blob, driver) = proxy.get_blob(&img, &o.digest, o.size).await?;
 
@@ -98,7 +115,8 @@ async fn get_blob(o: GetBlobOpts) -> Result<()> {
 }
 
 async fn get_blob_raw(o: GetBlobOpts) -> Result<()> {
-    let proxy = containers_image_proxy::ImageProxy::new().await?;
+    let config = o.common.to_config();
+    let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
     let img = proxy.open_image(&o.reference).await?;
     let (_, mut datafd, err) = proxy.get_raw_blob(&img, &o.digest).await?;
 
@@ -121,7 +139,7 @@ async fn get_blob_raw(o: GetBlobOpts) -> Result<()> {
 }
 
 async fn fetch_container_to_devnull(o: FetchContainerToDevNullOpts) -> Result<()> {
-    let config = o.metaopts.proxy_opts();
+    let config = o.metaopts.common.to_config();
     let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
     let img = &proxy.open_image(&o.metaopts.reference).await?;
     let manifest = proxy.fetch_manifest(img).await?.1;
