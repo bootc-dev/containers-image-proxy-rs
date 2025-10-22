@@ -210,6 +210,11 @@ pub struct ImageProxyConfig {
     /// If set, disable TLS verification.  Equivalent to `skopeo --tls-verify=false`.
     pub insecure_skip_tls_verification: Option<bool>,
 
+    /// Prefix to add to the user agent string. Equivalent to `skopeo --user-agent-prefix`.
+    /// The resulting user agent will be in the format "prefix skopeo/version".
+    /// This option is only used if the installed skopeo version supports it.
+    pub user_agent_prefix: Option<String>,
+
     /// If enabled, propagate debug-logging level from the proxy via stderr to the
     /// current process' stderr. Note than when enabled, this also means that standard
     /// error will no longer be captured.
@@ -236,6 +241,25 @@ pub struct ImageProxyConfig {
     /// You may use a different command name from `skopeo` if your
     /// application has set up a compatible copy, e.g. `/usr/lib/myapp/my-private-skopeo`/
     pub skopeo_cmd: Option<Command>,
+}
+
+/// Check if skopeo supports --user-agent-prefix by probing --help output
+fn supports_user_agent_prefix() -> bool {
+    static SUPPORTS_USER_AGENT: OnceLock<bool> = OnceLock::new();
+    *SUPPORTS_USER_AGENT.get_or_init(|| {
+        Command::new("skopeo")
+            .arg("--help")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .and_then(|output| {
+                String::from_utf8(output.stdout)
+                    .ok()
+                    .map(|help| help.contains("--user-agent-prefix"))
+            })
+            .unwrap_or(false)
+    })
 }
 
 impl TryFrom<ImageProxyConfig> for Command {
@@ -320,6 +344,15 @@ impl TryFrom<ImageProxyConfig> for Command {
         if config.insecure_skip_tls_verification.unwrap_or_default() {
             c.arg("--tls-verify=false");
         }
+
+        // Add user agent prefix if provided and supported by skopeo
+        if let Some(user_agent_prefix) = config.user_agent_prefix {
+            if supports_user_agent_prefix() {
+                c.arg("--user-agent-prefix");
+                c.arg(user_agent_prefix);
+            }
+        }
+
         c.stdout(Stdio::null());
         if !debug {
             c.stderr(Stdio::piped());
@@ -853,6 +886,18 @@ mod tests {
         })
         .unwrap();
         validate(c, &["--authfile", "/proc/self/fd/100"], &[]);
+
+        // Test user-agent-prefix - only validate if supported
+        let c = Command::try_from(ImageProxyConfig {
+            user_agent_prefix: Some("bootc/1.0".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        if supports_user_agent_prefix() {
+            validate(c, &["--user-agent-prefix", "bootc/1.0"], &[]);
+        } else {
+            validate(c, &[], &["--user-agent-prefix"]);
+        }
     }
 
     #[tokio::test]
