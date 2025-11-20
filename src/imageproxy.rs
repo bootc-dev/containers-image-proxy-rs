@@ -30,22 +30,22 @@ use tracing::instrument;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-    #[error("i/o error")]
+    #[error("i/o error: {0}")]
     /// An input/output error
     Io(#[from] std::io::Error),
-    #[error("skopeo spawn error: {}", .0)]
+    #[error("skopeo spawn error: {0}")]
     /// An error spawning skopeo
     SkopeoSpawnError(#[source] std::io::Error),
-    #[error("serialization error")]
+    #[error("serialization error: {0}")]
     /// Returned when serialization or deserialization fails
     SerDe(#[from] serde_json::Error),
     /// The proxy failed to initiate a request
     #[error("failed to invoke method {method}: {error}")]
     RequestInitiationFailure { method: Box<str>, error: Box<str> },
     /// An error returned from the remote proxy
-    #[error("proxy request returned error")]
+    #[error("proxy request returned error: {0}")]
     RequestReturned(Box<str>),
-    #[error("semantic version error")]
+    #[error("semantic version error: {0}")]
     SemanticVersion(#[from] semver::Error),
     #[error("proxy too old (requested={requested_version} found={found_version}) error")]
     /// The proxy doesn't support the requested semantic version
@@ -53,10 +53,10 @@ pub enum Error {
         requested_version: Box<str>,
         found_version: Box<str>,
     },
-    #[error("configuration error")]
+    #[error("configuration error: {0}")]
     /// Conflicting or missing configuration
     Configuration(Box<str>),
-    #[error("error")]
+    #[error("other error: {0}")]
     /// An unknown other error
     Other(Box<str>),
 }
@@ -72,9 +72,9 @@ impl Error {
 #[non_exhaustive]
 pub enum GetBlobError {
     /// A client may reasonably retry on this type of error.
-    #[error("retryable error")]
+    #[error("retryable error: {0}")]
     Retryable(Box<str>),
-    #[error("error")]
+    #[error("other error: {0}")]
     /// An unknown other error
     Other(Box<str>),
 }
