@@ -10,6 +10,7 @@ use futures_util::{Future, FutureExt};
 use itertools::Itertools;
 use oci_spec::image::{Descriptor, Digest};
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use std::fs::File;
 use std::iter::FusedIterator;
 use std::num::NonZeroU32;
@@ -21,8 +22,8 @@ use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncReadExt};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinError;
 use tracing::instrument;
 
@@ -45,6 +46,9 @@ pub enum Error {
     /// An error returned from the remote proxy
     #[error("proxy request returned error: {0}")]
     RequestReturned(Box<str>),
+    /// An error returned via the `GetRawBlob` error pipe.
+    #[error(transparent)]
+    BlobError(#[from] GetBlobError),
     #[error("semantic version error: {0}")]
     SemanticVersion(#[from] semver::Error),
     #[error("proxy too old (requested={requested_version} found={found_version}) error")]
@@ -88,6 +92,187 @@ impl From<rustix::io::Errno> for Error {
 /// The error type returned from this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobStreamSource {
+    /// Used `GetRawBlob`.
+    GetRawBlob,
+    /// Fell back to `GetBlob`.
+    GetBlob,
+}
+
+/// A streaming blob reader and "driver" future.
+pub struct BlobStream<'a> {
+    pub source: BlobStreamSource,
+    pub expected_size: u64,
+    pub reported_size: Option<u64>,
+    pub reader: Box<dyn AsyncRead + Send + Unpin>,
+    pub driver: futures_util::future::BoxFuture<'a, Result<()>>,
+}
+
+impl std::fmt::Debug for BlobStream<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobStream")
+            .field("source", &self.source)
+            .field("expected_size", &self.expected_size)
+            .field("reported_size", &self.reported_size)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+enum VerifiedBlobReadResult {
+    Complete { nbytes: u64, digest_hex: String },
+    Incomplete,
+}
+
+#[derive(Debug)]
+enum Hasher {
+    Sha256(sha2::Sha256),
+    Sha384(sha2::Sha384),
+    Sha512(sha2::Sha512),
+}
+
+impl Hasher {
+    fn new_for_digest(digest: &Digest) -> Result<Self> {
+        use oci_spec::image::DigestAlgorithm;
+        Ok(match digest.algorithm() {
+            DigestAlgorithm::Sha256 => Self::Sha256(sha2::Sha256::new()),
+            DigestAlgorithm::Sha384 => Self::Sha384(sha2::Sha384::new()),
+            DigestAlgorithm::Sha512 => Self::Sha512(sha2::Sha512::new()),
+            DigestAlgorithm::Other(a) => {
+                return Err(Error::Other(
+                    format!("Unsupported digest algorithm for blob verification: {a}").into(),
+                ));
+            }
+            _ => {
+                return Err(Error::Other(
+                    format!(
+                        "Unsupported digest algorithm for blob verification: {}",
+                        digest.algorithm().as_ref()
+                    )
+                    .into(),
+                ));
+            }
+        })
+    }
+
+    fn update(&mut self, chunk: &[u8]) {
+        match self {
+            Self::Sha256(h) => h.update(chunk),
+            Self::Sha384(h) => h.update(chunk),
+            Self::Sha512(h) => h.update(chunk),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        match self {
+            Self::Sha256(h) => hex::encode(h.finalize()),
+            Self::Sha384(h) => hex::encode(h.finalize()),
+            Self::Sha512(h) => hex::encode(h.finalize()),
+        }
+    }
+}
+
+/// Wraps an [`AsyncRead`] and computes a digest; reports the result on EOF.
+#[derive(Debug)]
+struct VerifiedBlobReader<R> {
+    inner: R,
+    nbytes: u64,
+    hasher: Option<Hasher>,
+    completion: Option<oneshot::Sender<VerifiedBlobReadResult>>,
+}
+
+impl<R: AsyncRead + Unpin> VerifiedBlobReader<R> {
+    fn new(
+        inner: R,
+        expected: Digest,
+        completion: oneshot::Sender<VerifiedBlobReadResult>,
+    ) -> Result<Self> {
+        let hasher = Hasher::new_for_digest(&expected)?;
+        Ok(Self {
+            inner,
+            nbytes: 0,
+            hasher: Some(hasher),
+            completion: Some(completion),
+        })
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for VerifiedBlobReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            v @ std::task::Poll::Ready(Ok(_)) => {
+                let after = buf.filled().len();
+                debug_assert!(after >= before);
+                let delta = after - before;
+                if delta > 0 {
+                    let chunk = &buf.filled()[before..after];
+                    if let Some(hasher) = self.hasher.as_mut() {
+                        hasher.update(chunk);
+                    }
+                    self.nbytes += delta as u64;
+                } else {
+                    // EOF reached
+                    let Some(tx) = self.completion.take() else {
+                        return v;
+                    };
+                    let Some(hasher) = self.hasher.take() else {
+                        return v;
+                    };
+                    let _ = tx.send(VerifiedBlobReadResult::Complete {
+                        nbytes: self.nbytes,
+                        digest_hex: hasher.finalize_hex(),
+                    });
+                }
+                v
+            }
+            o => o,
+        }
+    }
+}
+
+impl<R> Drop for VerifiedBlobReader<R> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.completion.take() {
+            let _ = tx.send(VerifiedBlobReadResult::Incomplete);
+        }
+    }
+}
+
+fn verify_blob_bytes_read(
+    expected: &Digest,
+    expected_size: u64,
+    r: VerifiedBlobReadResult,
+) -> Result<()> {
+    match r {
+        VerifiedBlobReadResult::Incomplete => Ok(()),
+        VerifiedBlobReadResult::Complete { nbytes, digest_hex } => {
+            if nbytes != expected_size {
+                return Err(Error::Other(
+                    format!(
+                        "Blob size mismatch for {expected}: expected {expected_size} bytes, read {nbytes} bytes"
+                    )
+                    .into(),
+                ));
+            }
+            if digest_hex != expected.digest() {
+                return Err(Error::Other(
+                    format!("Blob digest mismatch for {expected}: computed {digest_hex}").into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Re-export because we use this in our public APIs
 pub use oci_spec;
 
@@ -114,6 +299,11 @@ fn layer_info_proto_version() -> &'static semver::VersionReq {
 fn layer_info_piped_proto_version() -> &'static semver::VersionReq {
     static LAYER_INFO_PROTO_VERSION: OnceLock<semver::VersionReq> = OnceLock::new();
     LAYER_INFO_PROTO_VERSION.get_or_init(|| semver::VersionReq::parse("0.2.7").unwrap())
+}
+
+fn raw_blob_proto_version() -> &'static semver::VersionReq {
+    static RAW_BLOB_PROTO_VERSION: OnceLock<semver::VersionReq> = OnceLock::new();
+    RAW_BLOB_PROTO_VERSION.get_or_init(|| semver::VersionReq::parse("0.2.8").unwrap())
 }
 
 #[derive(Serialize)]
@@ -483,13 +673,21 @@ impl ImageProxy {
         let supported = base_proto_version();
         if !supported.matches(&protover) {
             return Err(Error::ProxyTooOld {
-                requested_version: protover.to_string().into(),
-                found_version: supported.to_string().into(),
+                requested_version: supported.to_string().into(),
+                found_version: protover.to_string().into(),
             });
         }
         r.protover = protover;
 
         Ok(r)
+    }
+
+    pub fn protocol_version(&self) -> &semver::Version {
+        &self.protover
+    }
+
+    pub fn supports_get_raw_blob(&self) -> bool {
+        raw_blob_proto_version().matches(&self.protover)
     }
 
     /// Create and send a request. Should only be used by impl_request.
@@ -737,6 +935,69 @@ impl ImageProxy {
         let fd = tokio::fs::File::from_std(std::fs::File::from(fds.datafd));
         let err = Self::read_blob_error(fds.errfd).boxed();
         Ok((bloblen, fd, err))
+    }
+
+    /// Fetch a blob as a stream, preferring `GetRawBlob` and falling back to `GetBlob`.
+    ///
+    /// The returned `driver` future completes only after proxy-side processing finishes; it also
+    /// verifies `expected_size` and `digest` for the `GetRawBlob` path.
+    #[instrument]
+    pub async fn get_blob_stream<'a>(
+        &'a self,
+        img: &OpenedImage,
+        digest: &Digest,
+        expected_size: u64,
+    ) -> Result<BlobStream<'a>> {
+        let fallback_to_get_blob = || async move {
+            let (reader, driver) = self.get_blob(img, digest, expected_size).await?;
+            let driver = async move { driver.await }.boxed();
+            Ok(BlobStream {
+                source: BlobStreamSource::GetBlob,
+                expected_size,
+                reported_size: Some(expected_size),
+                reader: Box::new(reader),
+                driver,
+            })
+        };
+
+        if !self.supports_get_raw_blob() {
+            return fallback_to_get_blob().await;
+        }
+
+        match self.get_raw_blob(img, digest).await {
+            Ok((reported_size, fd, err)) => {
+                if let Some(sz) = reported_size {
+                    if sz != expected_size {
+                        return Err(Error::Other(
+                            format!(
+                                "Blob size mismatch for {digest}: expected {expected_size} bytes, proxy reported {sz} bytes"
+                            )
+                            .into(),
+                        ));
+                    }
+                }
+
+                let expected = digest.clone();
+                let (tx, rx) = oneshot::channel();
+                let verified = VerifiedBlobReader::new(fd, expected.clone(), tx)?;
+                let driver = async move {
+                    err.await.map_err(Error::from)?;
+                    match rx.await {
+                        Ok(r) => verify_blob_bytes_read(&expected, expected_size, r),
+                        Err(_) => Ok(()),
+                    }
+                }
+                .boxed();
+                Ok(BlobStream {
+                    source: BlobStreamSource::GetRawBlob,
+                    expected_size,
+                    reported_size,
+                    reader: Box::new(verified),
+                    driver,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Fetch a descriptor. The requested size and digest are verified (by the proxy process).
@@ -995,6 +1256,64 @@ mod tests {
         let epipe = generate_err_fd(epipe)?;
         let err = ImageProxy::read_blob_error(epipe).boxed();
         err.await.unwrap();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_verified_blob_reader_ok() -> Result<()> {
+        use std::str::FromStr;
+        use tokio::io::AsyncReadExt;
+
+        let data = b"hello world";
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        tmp.as_file_mut().write_all(data)?;
+        tmp.as_file_mut().sync_all()?;
+
+        let digest = {
+            let mut h = sha2::Sha256::new();
+            h.update(data);
+            Digest::from_str(&format!("sha256:{}", hex::encode(h.finalize()))).unwrap()
+        };
+
+        let fd = tokio::fs::File::open(tmp.path()).await?;
+        let (tx, rx) = oneshot::channel();
+        let mut reader = VerifiedBlobReader::new(fd, digest.clone(), tx)?;
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await?;
+        assert_eq!(&out, data);
+
+        let result = rx.await.map_err(|e| Error::Other(e.to_string().into()))?;
+        verify_blob_bytes_read(&digest, data.len() as u64, result)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_verified_blob_reader_digest_mismatch() -> Result<()> {
+        use std::str::FromStr;
+        use tokio::io::AsyncReadExt;
+
+        let data = b"hello world";
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        tmp.as_file_mut().write_all(data)?;
+        tmp.as_file_mut().sync_all()?;
+
+        let digest = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"not the content");
+            Digest::from_str(&format!("sha256:{}", hex::encode(h.finalize()))).unwrap()
+        };
+
+        let fd = tokio::fs::File::open(tmp.path()).await?;
+        let (tx, rx) = oneshot::channel();
+        let mut reader = VerifiedBlobReader::new(fd, digest.clone(), tx)?;
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await?;
+        assert_eq!(&out, data);
+
+        let result = rx.await.map_err(|e| Error::Other(e.to_string().into()))?;
+        assert!(verify_blob_bytes_read(&digest, data.len() as u64, result).is_err());
         Ok(())
     }
 
