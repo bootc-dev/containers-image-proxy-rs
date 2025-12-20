@@ -51,3 +51,51 @@ jobs:
           fetch-depth: 20
       - name: Test ostree-rs-ext
         run: ./ci/test-ostree-rs-ext.sh
+
+  test-old-skopeo:
+    name: Test (old skopeo)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 20
+      - name: Test in AlmaLinux bootc container (skopeo 1.18)
+        run: |
+          set -euxo pipefail
+          rm -rf .ci-cargo-home
+          mkdir -p .ci-cargo-home
+          docker run --rm \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e EXPECT_BLOB_STREAM_SOURCE=GetBlob \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/.ci-cargo-home:/root/.cargo" \
+            -w /src \
+            quay.io/almalinuxorg/almalinux-bootc:10.0 \
+            sh -lc 'dnf -y install cargo rustc >/dev/null && skopeo --version && cargo test --all-features -- --nocapture --quiet'
+          sudo rm -rf .ci-cargo-home
+
+  test-new-skopeo:
+    name: Test (new skopeo)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 20
+      - name: Test in Fedora container (skopeo >= 1.19)
+        run: |
+          set -euxo pipefail
+          rm -rf .ci-cargo-home
+          mkdir -p .ci-cargo-home
+          docker run --rm \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e EXPECT_BLOB_STREAM_SOURCE=GetRawBlob \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/.ci-cargo-home:/root/.cargo" \
+            -w /src \
+            quay.io/fedora/fedora:41 \
+            sh -lc 'dnf -y install cargo rustc skopeo >/dev/null && skopeo --version && cargo test --all-features -- --nocapture --quiet'
+          sudo rm -rf .ci-cargo-home

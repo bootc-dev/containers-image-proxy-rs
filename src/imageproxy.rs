@@ -950,7 +950,7 @@ impl ImageProxy {
     ) -> Result<BlobStream<'a>> {
         let fallback_to_get_blob = || async move {
             let (reader, driver) = self.get_blob(img, digest, expected_size).await?;
-            let driver = async move { driver.await }.boxed();
+            let driver = driver.boxed();
             Ok(BlobStream {
                 source: BlobStreamSource::GetBlob,
                 expected_size,
@@ -1314,6 +1314,130 @@ mod tests {
 
         let result = rx.await.map_err(|e| Error::Other(e.to_string().into()))?;
         assert!(verify_blob_bytes_read(&digest, data.len() as u64, result).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_blob_stream_oci_dir() -> Result<()> {
+        use std::str::FromStr;
+
+        if !check_skopeo() {
+            return Ok(());
+        }
+
+        fn sha256_digest(bytes: &[u8]) -> Digest {
+            let mut h = sha2::Sha256::new();
+            h.update(bytes);
+            Digest::from_str(&format!("sha256:{}", hex::encode(h.finalize()))).unwrap()
+        }
+
+        fn write_blob(root: &std::path::Path, bytes: &[u8]) -> Result<(Digest, u64)> {
+            let digest = sha256_digest(bytes);
+            let size = bytes.len() as u64;
+            let dir = root.join("blobs").join("sha256");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(digest.digest()), bytes)?;
+            Ok((digest, size))
+        }
+
+        let td = tempfile::tempdir()?;
+        std::fs::write(
+            td.path().join("oci-layout"),
+            serde_json::to_vec(&serde_json::json!({"imageLayoutVersion":"1.0.0"}))?,
+        )?;
+
+        let layer_bytes = b"layer bytes";
+        let (layer_digest, layer_size) = write_blob(td.path(), layer_bytes)?;
+
+        let config_bytes = serde_json::to_vec(&serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": [layer_digest.to_string()],
+            },
+            "config": {},
+        }))?;
+        let (config_digest, config_size) = write_blob(td.path(), &config_bytes)?;
+
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest.to_string(),
+                "size": config_size,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": layer_digest.to_string(),
+                "size": layer_size,
+            }],
+        }))?;
+        let (manifest_digest, manifest_size) = write_blob(td.path(), &manifest_bytes)?;
+
+        std::fs::write(
+            td.path().join("index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": manifest_digest.to_string(),
+                    "size": manifest_size,
+                    "annotations": {
+                        "org.opencontainers.image.ref.name": "test",
+                    }
+                }]
+            }))?,
+        )?;
+
+        let proxy = ImageProxy::new().await?;
+        let imgref = format!("oci:{}:test", td.path().display());
+        let img = proxy.open_image(&imgref).await?;
+
+        let expected_source = match std::env::var("EXPECT_BLOB_STREAM_SOURCE").ok().as_deref() {
+            Some("GetRawBlob") => BlobStreamSource::GetRawBlob,
+            Some("GetBlob") => BlobStreamSource::GetBlob,
+            Some(v) => {
+                return Err(Error::Other(
+                    format!(
+                        "Invalid EXPECT_BLOB_STREAM_SOURCE={v}; expected GetRawBlob or GetBlob"
+                    )
+                    .into(),
+                ));
+            }
+            None => {
+                if proxy.supports_get_raw_blob() {
+                    BlobStreamSource::GetRawBlob
+                } else {
+                    BlobStreamSource::GetBlob
+                }
+            }
+        };
+
+        let BlobStream {
+            source,
+            reader,
+            driver,
+            ..
+        } = proxy
+            .get_blob_stream(&img, &layer_digest, layer_size)
+            .await?;
+        assert_eq!(source, expected_source);
+
+        let mut reader = reader;
+        let mut sink = tokio::io::sink();
+        let read = async move {
+            let n = tokio::io::copy(&mut *reader, &mut sink).await?;
+            Result::Ok(n)
+        };
+        let (n, driver) = tokio::join!(read, driver);
+        assert_eq!(n?, layer_size);
+        driver?;
+
+        proxy.close_image(&img).await?;
+        proxy.finalize().await?;
         Ok(())
     }
 
