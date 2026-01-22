@@ -1,0 +1,36 @@
+name: bootc Reverse Dependency CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bootc-test:
+    name: Build and test bootc with local containers-image-proxy-rs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Build and test bootc with local containers-image-proxy-rs
+        run: just bootc/test
