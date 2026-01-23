@@ -6,11 +6,19 @@
 
 pub mod transport;
 
+// Re-export oci_spec so consumers don't need to add it as a dependency.
+// NOTE: Bumping oci_spec in a semver-incompatible way requires bumping this crate too.
+// See Cargo.toml for details.
+pub use ::oci_spec;
+pub use transport::{
+    ContainersStorageRef, ImageReference, ImageReferenceError, Transport, TransportConversionError,
+};
+
+use ::oci_spec::image::{Descriptor, Digest};
 use cap_std_ext::prelude::CapStdExtCommandExt;
 use cap_std_ext::{cap_std, cap_tempfile};
 use futures_util::{Future, FutureExt};
 use itertools::Itertools;
-use oci_spec::image::{Descriptor, Digest};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::iter::FusedIterator;
@@ -89,9 +97,6 @@ impl From<rustix::io::Errno> for Error {
 
 /// The error type returned from this crate.
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Re-export because we use this in our public APIs
-pub use oci_spec;
 
 /// File descriptor range which is reserved for passing data down into the proxy;
 /// avoid configuring the command to use files in this range.  (Also, stdin is
@@ -586,6 +591,7 @@ impl ImageProxy {
         Ok(r)
     }
 
+    /// Open an image for fetching, using a string reference.
     #[instrument]
     pub async fn open_image(&self, imgref: &str) -> Result<OpenedImage> {
         tracing::debug!("opening image");
@@ -593,6 +599,14 @@ impl ImageProxy {
         Ok(OpenedImage(imgid))
     }
 
+    /// Open an image for fetching, using a structured [`ImageReference`].
+    #[instrument]
+    pub async fn open_image_ref(&self, imgref: &ImageReference) -> Result<OpenedImage> {
+        self.open_image(&imgref.to_string()).await
+    }
+
+    /// Open an image for fetching if it exists, using a string reference.
+    /// Returns `Ok(None)` if the image does not exist.
     #[instrument]
     pub async fn open_image_optional(&self, imgref: &str) -> Result<Option<OpenedImage>> {
         tracing::debug!("opening image");
@@ -602,6 +616,16 @@ impl ImageProxy {
         } else {
             Ok(Some(OpenedImage(imgid)))
         }
+    }
+
+    /// Open an image for fetching if it exists, using a structured [`ImageReference`].
+    /// Returns `Ok(None)` if the image does not exist.
+    #[instrument]
+    pub async fn open_image_optional_ref(
+        &self,
+        imgref: &ImageReference,
+    ) -> Result<Option<OpenedImage>> {
+        self.open_image_optional(&imgref.to_string()).await
     }
 
     #[instrument]
