@@ -4,6 +4,8 @@
 //!
 //! More information: <https://github.com/containers/skopeo/pull/1476>
 
+pub mod transport;
+
 use cap_std_ext::prelude::CapStdExtCommandExt;
 use cap_std_ext::{cap_std, cap_tempfile};
 use futures_util::{Future, FutureExt};
