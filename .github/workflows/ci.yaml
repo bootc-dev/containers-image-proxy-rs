@@ -17,6 +17,16 @@ env:
   RUST_BACKTRACE: short
 
 jobs:
+  semver-checks:
+    name: Semver Checks
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: obi1kenobi/cargo-semver-checks-action@v2
+      with:
+        # Pinned until cargo-semver-checks supports rustdoc format v57 (Rust 1.93+)
+        rust-toolchain: "1.92.0"
+
   build-test:
     name: Build+Test
     runs-on: ubuntu-latest
