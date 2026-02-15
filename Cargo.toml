@@ -22,7 +22,7 @@ thiserror = "2"
 tokio = { features = ["fs", "io-util", "macros", "process", "rt", "sync"], version = "1" }
 tracing = "0.1"
 # We support versions 2, 3 and 4
-cap-std-ext = ">= 2.0, <= 4.0"
+cap-std-ext = "<= 5.0"
 itertools = "0.14.0"
 
 [dev-dependencies]
