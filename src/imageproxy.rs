@@ -217,6 +217,9 @@ pub struct ImageProxyConfig {
     /// If set, disable TLS verification.  Equivalent to `skopeo --tls-verify=false`.
     pub insecure_skip_tls_verification: Option<bool>,
 
+    /// If set, disable signature verification. Equivalent to `skopeo --insecure-policy`.
+    pub insecure_policy: Option<bool>,
+
     /// Prefix to add to the user agent string. Equivalent to `skopeo --user-agent-prefix`.
     /// The resulting user agent will be in the format "prefix skopeo/version".
     /// This option is only used if the installed skopeo version supports it.
@@ -349,6 +352,10 @@ impl TryFrom<ImageProxyConfig> for Command {
 
         if config.insecure_skip_tls_verification.unwrap_or_default() {
             c.arg("--tls-verify=false");
+        }
+
+        if config.insecure_policy.unwrap_or_default() {
+            c.arg("--insecure-policy");
         }
 
         // Add user agent prefix if provided and supported by skopeo
@@ -901,6 +908,13 @@ mod tests {
         })
         .unwrap();
         validate(c, &[r"--tls-verify=false"], &[]);
+
+        let c = Command::try_from(ImageProxyConfig {
+            insecure_policy: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        validate(c, &[r"--insecure-policy"], &[]);
 
         let mut tmpf = cap_tempfile::TempFile::new_anonymous(tmpd).unwrap();
         tmpf.write_all(r#"{ "auths": {} "#.as_bytes()).unwrap();
