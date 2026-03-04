@@ -193,6 +193,7 @@ impl PipeId {
 
 /// Configuration for the proxy.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct ImageProxyConfig {
     /// Path to container auth file; equivalent to `skopeo --authfile`.
     /// This conflicts with [`auth_data`].
