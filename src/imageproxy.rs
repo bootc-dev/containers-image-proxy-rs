@@ -287,6 +287,8 @@ impl TryFrom<ImageProxyConfig> for Command {
         // By default, we set up pdeathsig to "lifecycle bind" the child process to us.
         let mut c = config.skopeo_cmd.unwrap_or_else(|| {
             let mut c = std::process::Command::new("skopeo");
+            // SAFETY: set_parent_process_death_signal is async-signal-safe
+            #[allow(unsafe_code)]
             unsafe {
                 c.pre_exec(|| {
                     Ok(rustix::process::set_parent_process_death_signal(Some(
