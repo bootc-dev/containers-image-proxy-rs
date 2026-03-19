@@ -1,20 +1,21 @@
 name: CI
 
 permissions:
-  actions: read
+  contents: read
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+# don't waste job slots on superseded code
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-  CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
-  CI: 1
-  RUSTUP_MAX_RETRIES: 10
-  RUST_BACKTRACE: short
 
 jobs:
   semver-checks:
@@ -27,14 +28,27 @@ jobs:
         # Pinned until cargo-semver-checks supports rustdoc format v57 (Rust 1.93+)
         rust-toolchain: "1.92.0"
 
+  linting:
+    name: Lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        uses: bootc-dev/actions/setup-rust@main
+      - name: Install tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Install rustfmt and clippy
+        run: rustup component add rustfmt clippy
+      - name: just lint
+        run: just lint
+
   build-test:
     name: Build+Test
     runs-on: ubuntu-latest
     container: quay.io/coreos-assembler/fcos-buildroot:testing-devel
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -43,16 +57,12 @@ jobs:
           fetch-depth: 20
       - name: Cache Dependencies
         uses: Swatinem/rust-cache@v2
-      - name: cargo fmt (check)
-        run: cargo fmt -- --check -l
       - name: Compile (no features)
         run: cargo test --no-run
       - name: Compile (all features)
         run: cargo test --no-run --all-features
       - name: Test
         run: cargo test --all-features -- --nocapture --quiet
-      - name: cargo clippy (non-gating)
-        run: cargo clippy
       - name: Checkout ostree-rs-ext
         uses: actions/checkout@v6
         with:
