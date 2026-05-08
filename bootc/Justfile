@@ -1,0 +1,125 @@
+# Justfile for bootc reverse dependency testing
+# Invoked via: just bootc/<target>
+#
+# This builds and tests bootc against the local containers-image-proxy-rs checkout
+# using bootc's auto-detection of path dependencies via `cargo xtask local-rust-deps`.
+# --------------------------------------------------------------------
+
+# Configuration variables (override via environment or command line)
+# Example: IMAGE_PROXY_BOOTC_REF=v1.0.0 just bootc/build
+
+# Path to bootc checkout (will be cloned if it doesn't exist)
+# Note: Use source_directory() not justfile_directory() so paths resolve correctly
+# when invoked as a submodule (just bootc::test) vs directly (cd bootc && just test)
+export IMAGE_PROXY_BOOTC_PATH := env("IMAGE_PROXY_BOOTC_PATH", source_directory() + "/../target/bootc")
+# Git ref to checkout for bootc (branch, tag, or PR ref)
+export IMAGE_PROXY_BOOTC_REF := env("IMAGE_PROXY_BOOTC_REF", "main")
+# Remote repository for bootc
+export IMAGE_PROXY_BOOTC_REPO := env("IMAGE_PROXY_BOOTC_REPO", "https://github.com/bootc-dev/bootc")
+
+# Internal: absolute path to the containers-image-proxy-rs checkout (parent of this Justfile)
+export _PROXY_SRC := canonicalize(source_directory() + "/..")
+
+# Clone or update bootc repository
+clone:
+    #!/bin/bash
+    set -euo pipefail
+    if [ -d "$IMAGE_PROXY_BOOTC_PATH/.git" ]; then
+        echo "bootc already cloned at $IMAGE_PROXY_BOOTC_PATH"
+        echo "To update: cd $IMAGE_PROXY_BOOTC_PATH && git fetch && git checkout <ref>"
+    else
+        echo "Cloning bootc from $IMAGE_PROXY_BOOTC_REPO (ref: $IMAGE_PROXY_BOOTC_REF) to $IMAGE_PROXY_BOOTC_PATH"
+        mkdir -p "$(dirname "$IMAGE_PROXY_BOOTC_PATH")"
+        # Use --no-checkout with --filter for efficient cloning, then fetch the specific ref
+        # This handles PR refs (refs/pull/123/head) correctly
+        git clone "$IMAGE_PROXY_BOOTC_REPO" "$IMAGE_PROXY_BOOTC_PATH" --no-checkout --filter=blob:none
+        cd "$IMAGE_PROXY_BOOTC_PATH"
+        git fetch --depth=1 origin "$IMAGE_PROXY_BOOTC_REF"
+        git checkout FETCH_HEAD
+    fi
+
+# Patch bootc's Cargo.toml to use the local containers-image-proxy-rs checkout
+# The path is auto-detected and bind-mounted by bootc's `cargo xtask local-rust-deps`
+patch: clone
+    #!/bin/bash
+    set -euo pipefail
+    cd "$IMAGE_PROXY_BOOTC_PATH"
+
+    # Check if already patched
+    if grep -q 'Patched by containers-image-proxy-rs' Cargo.toml 2>/dev/null; then
+        echo "bootc already patched for containers-image-proxy-rs"
+        exit 0
+    fi
+
+    echo "Patching bootc Cargo.toml to use $_PROXY_SRC"
+
+    # Add [patch] section with the real local path
+    # bootc's Justfile will auto-detect this via `cargo xtask local-rust-deps`
+    # and bind-mount it into the container build (mapping /home -> /var/home as needed)
+    {
+        echo ''
+        echo '# Patched by containers-image-proxy-rs CI to test against local checkout'
+        echo '[patch.crates-io]'
+        echo "containers-image-proxy = { path = \"$_PROXY_SRC\" }"
+    } >> Cargo.toml
+
+    # Patch the workspace lints to allow missing_docs for containers-image-proxy-rs
+    # bootc has workspace.lints.rust.missing_docs = "deny" but this crate has undocumented items
+    sed -i 's/missing_docs = "deny"/missing_docs = "allow"/' Cargo.toml
+
+    # Update Cargo.lock so the patch is recognized by cargo xtask local-rust-deps
+    cargo update containers-image-proxy
+
+    echo "bootc patched successfully"
+
+# Build sealed bootc image using local containers-image-proxy-rs
+# The path dependency is auto-detected and bind-mounted by bootc's Justfile
+build: patch
+    #!/bin/bash
+    set -euo pipefail
+    cd "$IMAGE_PROXY_BOOTC_PATH"
+    echo "Building sealed bootc image with local containers-image-proxy-rs from $_PROXY_SRC"
+    just build-sealed
+
+# Run bootc tests using local containers-image-proxy-rs
+# Since the patch uses real local paths, no symlinks or special env vars needed
+test: build
+    #!/bin/bash
+    set -euo pipefail
+    cd "$IMAGE_PROXY_BOOTC_PATH"
+    echo "Running bootc tests..."
+    cargo test --workspace
+
+# Clean the bootc checkout and any patches
+clean:
+    #!/bin/bash
+    set -euo pipefail
+    if [ -d "$IMAGE_PROXY_BOOTC_PATH" ]; then
+        echo "Removing bootc checkout at $IMAGE_PROXY_BOOTC_PATH"
+        rm -rf "$IMAGE_PROXY_BOOTC_PATH"
+    else
+        echo "No bootc checkout found at $IMAGE_PROXY_BOOTC_PATH"
+    fi
+
+# Show current bootc integration configuration
+config:
+    #!/bin/bash
+    cat <<EOF
+    Bootc Integration Configuration
+    ================================
+    path:  $IMAGE_PROXY_BOOTC_PATH
+    ref:   $IMAGE_PROXY_BOOTC_REF
+    repo:  $IMAGE_PROXY_BOOTC_REPO
+
+    containers-image-proxy-rs source: $_PROXY_SRC
+
+    Environment Variables:
+      IMAGE_PROXY_BOOTC_PATH - Override bootc checkout path
+      IMAGE_PROXY_BOOTC_REF  - Override bootc git ref (branch/tag/PR)
+      IMAGE_PROXY_BOOTC_REPO - Override bootc git repository
+
+    Example Usage:
+      just bootc/build                                      # Clone main, patch, and build
+      IMAGE_PROXY_BOOTC_REF=v1.2.0 just bootc/build         # Use specific tag
+      IMAGE_PROXY_BOOTC_REF=refs/pull/1791/head just bootc/build  # Use PR
+    EOF
