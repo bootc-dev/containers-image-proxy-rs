@@ -494,6 +494,45 @@ mod tests {
     }
 
     #[test]
+    fn test_bare_transport_parsing() {
+        // Test parsing bare transport names without image references
+        assert!(matches!(
+            Transport::try_from("registry"),
+            Ok(Transport::Registry)
+        ));
+        assert!(matches!(Transport::try_from("oci"), Ok(Transport::OciDir)));
+        assert!(matches!(
+            Transport::try_from("oci-archive"),
+            Ok(Transport::OciArchive)
+        ));
+        assert!(matches!(
+            Transport::try_from("docker-archive"),
+            Ok(Transport::DockerArchive)
+        ));
+        assert!(matches!(
+            Transport::try_from("containers-storage"),
+            Ok(Transport::ContainerStorage)
+        ));
+        assert!(matches!(Transport::try_from("dir"), Ok(Transport::Dir)));
+        assert!(matches!(
+            Transport::try_from("docker-daemon"),
+            Ok(Transport::DockerDaemon)
+        ));
+
+        // Test that bare "docker" fails (needs docker://)
+        assert!(matches!(
+            Transport::try_from("docker"),
+            Err(TransportConversionError::MissingDockerSlashes(_))
+        ));
+
+        // Test unknown bare transport
+        assert!(matches!(
+            Transport::try_from("unknown"),
+            Err(TransportConversionError::InvalidTransport(_))
+        ));
+    }
+
+    #[test]
     fn test_transport_edge_cases() {
         // Test transport at end of string
         assert!(matches!(
