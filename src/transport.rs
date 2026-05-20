@@ -8,6 +8,8 @@ use thiserror::Error;
 pub enum TransportConversionError {
     #[error("Invalid transport: {0}")]
     InvalidTransport(Box<str>),
+    #[error("Missing // in docker:// in {0}")]
+    MissingDockerSlashes(Box<str>),
     #[error("Missing ':' in imgref")]
     MissingColon,
 }
@@ -16,14 +18,14 @@ pub enum TransportConversionError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ImageReferenceError {
-    #[error("Unknown transport '{0}'")]
+    #[error("Invalid transport: {0}")]
     InvalidTransport(Box<str>),
+    #[error("Missing // in docker:// in {0}")]
+    MissingDockerSlashes(Box<str>),
     #[error("Missing ':' in {0}")]
     MissingColon(Box<str>),
     #[error("Invalid empty name in {0}")]
     EmptyName(Box<str>),
-    #[error("Missing // in docker:// in {0}")]
-    MissingDockerSlashes(Box<str>),
 }
 
 /// A backend/transport for OCI/Docker images.
@@ -71,34 +73,36 @@ impl TryFrom<&str> for Transport {
     /// Supports various transport types like "registry:", "oci:", "docker://", etc.
     /// Returns an error for unknown transports or malformed references without colons.
     fn try_from(imgref: &str) -> Result<Self, TransportConversionError> {
-        if let Some(colon_pos) = imgref.find(':') {
-            let transport_prefix = &imgref[..colon_pos];
+        let (transport_name, rest) = match imgref.find(':') {
+            Some(colon_pos) => (&imgref[..colon_pos], &imgref[colon_pos..]),
+            // A simple transport like "oci", "registry" was passed in
+            None => (imgref, ""),
+        };
 
-            let transport = match transport_prefix {
-                "registry" => Transport::Registry,
-                "oci" => Transport::OciDir,
-                "oci-archive" => Transport::OciArchive,
-                "docker-archive" => Transport::DockerArchive,
-                "containers-storage" => Transport::ContainerStorage,
-                "dir" => Transport::Dir,
-                "docker-daemon" => Transport::DockerDaemon,
-                "docker" => {
-                    // Check if this is actually "docker://" format
-                    if imgref[colon_pos..].starts_with("://") {
-                        Transport::Registry
-                    } else {
-                        return Err(TransportConversionError::InvalidTransport(
-                            transport_prefix.into(),
-                        ));
-                    }
+        let transport = match transport_name {
+            "registry" => Transport::Registry,
+            "oci" => Transport::OciDir,
+            "oci-archive" => Transport::OciArchive,
+            "docker-archive" => Transport::DockerArchive,
+            "containers-storage" => Transport::ContainerStorage,
+            "dir" => Transport::Dir,
+            "docker-daemon" => Transport::DockerDaemon,
+            "docker" => {
+                // Check if this is actually "docker://" format
+                if rest.starts_with("://") {
+                    Transport::Registry
+                } else {
+                    return Err(
+                        TransportConversionError::MissingDockerSlashes(imgref.into()).into(),
+                    );
                 }
-                prefix => return Err(TransportConversionError::InvalidTransport(prefix.into())),
-            };
+            }
+            prefix => {
+                return Err(TransportConversionError::InvalidTransport(prefix.into()).into());
+            }
+        };
 
-            return Ok(transport);
-        }
-
-        Err(TransportConversionError::MissingColon)
+        Ok(transport)
     }
 }
 
@@ -453,11 +457,11 @@ mod tests {
         // Test missing colon (bare image reference without transport)
         assert!(matches!(
             Transport::try_from("docker.io/library/hello-world"),
-            Err(TransportConversionError::MissingColon)
+            Err(TransportConversionError::InvalidTransport(_))
         ));
         assert!(matches!(
             Transport::try_from("example.com/image"),
-            Err(TransportConversionError::MissingColon)
+            Err(TransportConversionError::InvalidTransport(_))
         ));
 
         // Test invalid transport prefixes
@@ -473,13 +477,13 @@ mod tests {
         // Test docker: without :// (should error)
         assert!(matches!(
             Transport::try_from("docker:example.com/image"),
-            Err(TransportConversionError::InvalidTransport(_))
+            Err(TransportConversionError::MissingDockerSlashes(_))
         ));
 
         // Test empty string
         assert!(matches!(
             Transport::try_from(""),
-            Err(TransportConversionError::MissingColon)
+            Err(TransportConversionError::InvalidTransport(_))
         ));
 
         // Test just colon
@@ -520,8 +524,11 @@ mod tests {
         let err = TransportConversionError::InvalidTransport("unknown".into());
         assert_eq!(err.to_string(), "Invalid transport: unknown");
 
-        let err = TransportConversionError::MissingColon;
-        assert_eq!(err.to_string(), "Missing ':' in imgref");
+        let err = TransportConversionError::MissingDockerSlashes("docker:example.com".into());
+        assert_eq!(
+            err.to_string(),
+            "Missing // in docker:// in docker:example.com"
+        );
     }
 
     #[test]
