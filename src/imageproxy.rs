@@ -30,6 +30,7 @@ use std::os::unix::prelude::CommandExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, ReadBuf};
@@ -112,11 +113,29 @@ pub enum BlobStreamSource {
 
 /// A streaming blob reader and "driver" future.
 pub struct BlobStream<'a> {
-    pub source: BlobStreamSource,
-    pub expected_size: u64,
-    pub reported_size: Option<u64>,
-    pub reader: Box<dyn AsyncRead + Send + Unpin>,
-    pub driver: futures_util::future::BoxFuture<'a, Result<()>>,
+    source: BlobStreamSource,
+    expected_size: u64,
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+    driver: futures_util::future::BoxFuture<'a, Result<()>>,
+}
+
+impl<'a> BlobStream<'a> {
+    pub fn source(&self) -> BlobStreamSource {
+        self.source
+    }
+
+    pub fn expected_size(&self) -> u64 {
+        self.expected_size
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Box<dyn AsyncRead + Send + Unpin>,
+        futures_util::future::BoxFuture<'a, Result<()>>,
+    ) {
+        (self.reader, self.driver)
+    }
 }
 
 impl std::fmt::Debug for BlobStream<'_> {
@@ -124,14 +143,13 @@ impl std::fmt::Debug for BlobStream<'_> {
         f.debug_struct("BlobStream")
             .field("source", &self.source)
             .field("expected_size", &self.expected_size)
-            .field("reported_size", &self.reported_size)
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Debug)]
 enum VerifiedBlobReadResult {
-    Complete { nbytes: u64, digest_hex: String },
+    Complete { nbytes: u64, digest: Digest },
     Incomplete,
 }
 
@@ -174,16 +192,18 @@ impl Hasher {
         }
     }
 
-    fn finalize_hex(self) -> String {
-        match self {
-            Self::Sha256(h) => hex::encode(h.finalize()),
-            Self::Sha384(h) => hex::encode(h.finalize()),
-            Self::Sha512(h) => hex::encode(h.finalize()),
-        }
+    fn finalize_digest(self) -> Digest {
+        let (algorithm, hex) = match self {
+            Self::Sha256(h) => ("sha256", hex::encode(h.finalize())),
+            Self::Sha384(h) => ("sha384", hex::encode(h.finalize())),
+            Self::Sha512(h) => ("sha512", hex::encode(h.finalize())),
+        };
+        Digest::from_str(&format!("{algorithm}:{hex}")).expect("valid digest")
     }
 }
 
-/// Wraps an [`AsyncRead`] and computes a digest; reports the result on EOF.
+/// Wraps an [`AsyncRead`] and computes a digest; sends the result on EOF so the
+/// driver future can verify the stream without re-reading it.
 #[derive(Debug)]
 struct VerifiedBlobReader<R> {
     inner: R,
@@ -217,17 +237,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for VerifiedBlobReader<R> {
         if buf.remaining() == 0 {
             return std::task::Poll::Ready(Ok(()));
         }
+        // ReadBuf may already have data; only hash the newly appended bytes.
         let before = buf.filled().len();
         match Pin::new(&mut self.inner).poll_read(cx, buf) {
-            v @ std::task::Poll::Ready(Ok(_)) => {
+            v @ std::task::Poll::Ready(Ok(())) => {
                 let after = buf.filled().len();
-                debug_assert!(after >= before);
-                let delta = after - before;
+                let delta = after.checked_sub(before).unwrap();
                 if delta > 0 {
                     let chunk = &buf.filled()[before..after];
-                    if let Some(hasher) = self.hasher.as_mut() {
-                        hasher.update(chunk);
-                    }
+                    let hasher = self.hasher.as_mut().expect("hasher missing before EOF");
+                    hasher.update(chunk);
                     self.nbytes += delta as u64;
                 } else {
                     // EOF reached
@@ -239,7 +258,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for VerifiedBlobReader<R> {
                     };
                     let _ = tx.send(VerifiedBlobReadResult::Complete {
                         nbytes: self.nbytes,
-                        digest_hex: hasher.finalize_hex(),
+                        digest: hasher.finalize_digest(),
                     });
                 }
                 v
@@ -264,7 +283,7 @@ fn verify_blob_bytes_read(
 ) -> Result<()> {
     match r {
         VerifiedBlobReadResult::Incomplete => Ok(()),
-        VerifiedBlobReadResult::Complete { nbytes, digest_hex } => {
+        VerifiedBlobReadResult::Complete { nbytes, digest } => {
             if nbytes != expected_size {
                 return Err(Error::Other(
                     format!(
@@ -273,9 +292,9 @@ fn verify_blob_bytes_read(
                     .into(),
                 ));
             }
-            if digest_hex != expected.digest() {
+            if digest != *expected {
                 return Err(Error::Other(
-                    format!("Blob digest mismatch for {expected}: computed {digest_hex}").into(),
+                    format!("Blob digest mismatch for {expected}: computed {digest}").into(),
                 ));
             }
             Ok(())
@@ -982,56 +1001,48 @@ impl ImageProxy {
         digest: &Digest,
         expected_size: u64,
     ) -> Result<BlobStream<'a>> {
-        let fallback_to_get_blob = || async move {
+        if !self.supports_get_raw_blob() {
             let (reader, driver) = self.get_blob(img, digest, expected_size).await?;
             let driver = driver.boxed();
-            Ok(BlobStream {
+            return Ok(BlobStream {
                 source: BlobStreamSource::GetBlob,
                 expected_size,
-                reported_size: Some(expected_size),
                 reader: Box::new(reader),
                 driver,
-            })
-        };
-
-        if !self.supports_get_raw_blob() {
-            return fallback_to_get_blob().await;
+            });
         }
 
-        match self.get_raw_blob(img, digest).await {
-            Ok((reported_size, fd, err)) => {
-                if let Some(sz) = reported_size {
-                    if sz != expected_size {
-                        return Err(Error::Other(
-                            format!(
-                                "Blob size mismatch for {digest}: expected {expected_size} bytes, proxy reported {sz} bytes"
-                            )
-                            .into(),
-                        ));
-                    }
-                }
-
-                let expected = digest.clone();
-                let (tx, rx) = oneshot::channel();
-                let verified = VerifiedBlobReader::new(fd, expected.clone(), tx)?;
-                let driver = async move {
-                    err.await.map_err(Error::from)?;
-                    match rx.await {
-                        Ok(r) => verify_blob_bytes_read(&expected, expected_size, r),
-                        Err(_) => Ok(()),
-                    }
-                }
-                .boxed();
-                Ok(BlobStream {
-                    source: BlobStreamSource::GetRawBlob,
-                    expected_size,
-                    reported_size,
-                    reader: Box::new(verified),
-                    driver,
-                })
+        let (reported_size, fd, err) = self.get_raw_blob(img, digest).await?;
+        if let Some(sz) = reported_size {
+            if sz != expected_size {
+                return Err(Error::Other(
+                    format!(
+                        "Blob size mismatch for {digest}: expected {expected_size} bytes, got {sz} bytes"
+                    )
+                    .into(),
+                ));
             }
-            Err(e) => Err(e),
         }
+
+        let expected = digest.clone();
+        let (tx, rx) = oneshot::channel();
+        let verified = VerifiedBlobReader::new(fd, expected.clone(), tx)?;
+        let driver = async move {
+            err.await.map_err(Error::from)?;
+            match rx.await {
+                Ok(r) => verify_blob_bytes_read(&expected, expected_size, r),
+                Err(e) => Err(Error::Other(
+                    format!("Blob stream verification channel error: {e}").into(),
+                )),
+            }
+        }
+        .boxed();
+        Ok(BlobStream {
+            source: BlobStreamSource::GetRawBlob,
+            expected_size,
+            reader: Box::new(verified),
+            driver,
+        })
     }
 
     /// Fetch a descriptor. The requested size and digest are verified (by the proxy process).
@@ -1360,78 +1371,50 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_blob_stream_oci_dir() -> Result<()> {
-        use std::str::FromStr;
+        use ocidir::{oci_spec as ocidir_spec, OciDir};
 
         if !check_skopeo() {
             return Ok(());
         }
 
-        fn sha256_digest(bytes: &[u8]) -> Digest {
-            let mut h = sha2::Sha256::new();
-            h.update(bytes);
-            Digest::from_str(&format!("sha256:{}", hex::encode(h.finalize()))).unwrap()
-        }
-
-        fn write_blob(root: &std::path::Path, bytes: &[u8]) -> Result<(Digest, u64)> {
-            let digest = sha256_digest(bytes);
-            let size = bytes.len() as u64;
-            let dir = root.join("blobs").join("sha256");
-            std::fs::create_dir_all(&dir)?;
-            std::fs::write(dir.join(digest.digest()), bytes)?;
-            Ok((digest, size))
-        }
-
         let td = tempfile::tempdir()?;
-        std::fs::write(
-            td.path().join("oci-layout"),
-            serde_json::to_vec(&serde_json::json!({"imageLayoutVersion":"1.0.0"}))?,
-        )?;
-
+        fn to_other<E: std::fmt::Display>(e: E) -> Error {
+            Error::Other(e.to_string().into())
+        }
         let layer_bytes = b"layer bytes";
-        let (layer_digest, layer_size) = write_blob(td.path(), layer_bytes)?;
+        let dir = ocidir::cap_std::fs::Dir::open_ambient_dir(
+            td.path(),
+            ocidir::cap_std::ambient_authority(),
+        )
+        .map_err(to_other)?;
+        let oci_dir = OciDir::ensure(dir).map_err(to_other)?;
+        let mut layerw = oci_dir.create_gzip_layer(None).map_err(to_other)?;
+        layerw.write_all(layer_bytes)?;
+        let layer = layerw.complete().map_err(to_other)?;
+        let layer_desc = layer.descriptor().build().unwrap();
+        let layer_digest = Digest::from_str(layer_desc.digest().as_ref()).map_err(to_other)?;
+        let layer_size = layer_desc.size();
 
-        let config_bytes = serde_json::to_vec(&serde_json::json!({
-            "architecture": "amd64",
-            "os": "linux",
-            "rootfs": {
-                "type": "layers",
-                "diff_ids": [layer_digest.to_string()],
-            },
-            "config": {},
-        }))?;
-        let (config_digest, config_size) = write_blob(td.path(), &config_bytes)?;
-
-        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_digest.to_string(),
-                "size": config_size,
-            },
-            "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar",
-                "digest": layer_digest.to_string(),
-                "size": layer_size,
-            }],
-        }))?;
-        let (manifest_digest, manifest_size) = write_blob(td.path(), &manifest_bytes)?;
-
-        std::fs::write(
-            td.path().join("index.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.index.v1+json",
-                "manifests": [{
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": manifest_digest.to_string(),
-                    "size": manifest_size,
-                    "annotations": {
-                        "org.opencontainers.image.ref.name": "test",
-                    }
-                }]
-            }))?,
-        )?;
+        let mut manifest = oci_dir
+            .new_empty_manifest()
+            .map_err(to_other)?
+            .build()
+            .map_err(to_other)?;
+        let mut config = ocidir_spec::image::ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .build()
+            .unwrap();
+        oci_dir.push_layer(&mut manifest, &mut config, layer, "layer", None);
+        let config_desc = oci_dir.write_config(config).map_err(to_other)?;
+        manifest.set_config(config_desc);
+        oci_dir
+            .insert_manifest(
+                manifest,
+                Some("test"),
+                ocidir_spec::image::Platform::default(),
+            )
+            .map_err(to_other)?;
 
         let proxy = ImageProxy::new().await?;
         let imgref = format!("oci:{}:test", td.path().display());
@@ -1457,17 +1440,12 @@ mod tests {
             }
         };
 
-        let BlobStream {
-            source,
-            reader,
-            driver,
-            ..
-        } = proxy
+        let stream = proxy
             .get_blob_stream(&img, &layer_digest, layer_size)
             .await?;
-        assert_eq!(source, expected_source);
+        assert_eq!(stream.source(), expected_source);
+        let (mut reader, driver) = stream.into_parts();
 
-        let mut reader = reader;
         let mut sink = tokio::io::sink();
         let read = async move {
             let n = tokio::io::copy(&mut *reader, &mut sink).await?;
