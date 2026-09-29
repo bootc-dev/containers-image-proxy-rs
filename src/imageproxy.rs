@@ -54,6 +54,10 @@ pub enum Error {
     /// The proxy failed to initiate a request
     #[error("failed to invoke method {method}: {error}")]
     RequestInitiationFailure { method: Box<str>, error: Box<str> },
+    /// The proxy failed a request with an error that it considers transient,
+    /// so that retrying it may succeed; see [`Error::is_retryable()`].
+    #[error("failed to invoke method {method}: {error}")]
+    RetryableRequestFailure { method: Box<str>, error: Box<str> },
     /// An error returned from the remote proxy
     #[error("proxy request returned error: {0}")]
     RequestReturned(Box<str>),
@@ -79,6 +83,23 @@ pub enum Error {
 impl Error {
     pub(crate) fn new_other(e: impl Into<Box<str>>) -> Self {
         Self::Other(e.into())
+    }
+
+    /// Whether the proxy classified this error as transient, such as a
+    /// network failure or an HTTP 502-504 response from a registry, so
+    /// that retrying the operation may succeed.
+    ///
+    /// The proxy decides this with containers/common's `IsErrorRetryable()`,
+    /// the same heuristic podman uses to decide whether to retry a pull.
+    /// This crate does not retry anything itself; that is up to the caller.
+    ///
+    /// Proxies older than protocol version 0.2.8 (skopeo 1.19) don't
+    /// classify their errors, so with them this is always false.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::RetryableRequestFailure { .. } | Self::BlobError(GetBlobError::Retryable(_))
+        )
     }
 }
 
@@ -359,12 +380,31 @@ impl Request {
     }
 }
 
+/// The error code with which the proxy marks transient errors, both in
+/// replies and on the `GetRawBlob` error pipe.
+const PROXY_ERR_RETRYABLE: &str = "retryable";
+
 #[derive(Deserialize)]
 struct Reply {
     success: bool,
     error: String,
+    /// Classifies `error`; added in protocol version 0.2.8.
+    #[serde(default)]
+    error_code: String,
     pipeid: u32,
     value: serde_json::Value,
+}
+
+impl Reply {
+    /// The error for a failed request of `method`.
+    fn into_error(self, method: &str) -> Error {
+        let (method, error) = (method.into(), self.error.into());
+        if self.error_code == PROXY_ERR_RETRYABLE {
+            Error::RetryableRequestFailure { method, error }
+        } else {
+            Error::RequestInitiationFailure { method, error }
+        }
+    }
 }
 
 type ChildFuture = Pin<
@@ -760,10 +800,7 @@ impl ImageProxy {
             let buf = &buf[..nread];
             let reply: Reply = serde_json::from_slice(buf)?;
             if !reply.success {
-                return Err(Error::RequestInitiationFailure {
-                    method: req.method.clone().into(),
-                    error: reply.error.into(),
-                });
+                return Err(reply.into_error(&req.method));
             }
             let fds = FromReplyFds::from_reply(fdret, reply.pipeid)?;
             Ok((serde_json::from_value(reply.value)?, fds))
@@ -962,7 +999,7 @@ impl ImageProxy {
         match e.code.as_str() {
             // Actually this is OK
             "EPIPE" => Ok(()),
-            "retryable" => Err(GetBlobError::Retryable(e.message.into_boxed_str())),
+            PROXY_ERR_RETRYABLE => Err(GetBlobError::Retryable(e.message.into_boxed_str())),
             _ => Err(GetBlobError::Other(e.message.into_boxed_str())),
         }
     }
@@ -1271,6 +1308,83 @@ mod tests {
             GetBlobError::Retryable(s) => assert_eq!(s.as_ref(), "foo"),
             _ => panic!("Unexpected error {e:?}"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_retryable() {
+        let reply = |v: serde_json::Value| -> Error {
+            serde_json::from_value::<Reply>(v)
+                .unwrap()
+                .into_error("OpenImage")
+        };
+        let cases = [
+            (
+                reply(serde_json::json!({
+                    "success": false, "error": "connection refused", "error_code": "retryable",
+                    "pipeid": 0, "value": null,
+                })),
+                true,
+            ),
+            (
+                reply(serde_json::json!({
+                    "success": false, "error": "manifest unknown", "error_code": "other",
+                    "pipeid": 0, "value": null,
+                })),
+                false,
+            ),
+            // Proxies before protocol 0.2.8 send no error code
+            (
+                reply(serde_json::json!({
+                    "success": false, "error": "connection refused", "pipeid": 0, "value": null,
+                })),
+                false,
+            ),
+            (GetBlobError::Retryable("reset".into()).into(), true),
+            (GetBlobError::Other("reset".into()).into(), false),
+            (Error::new_other("connection refused"), false),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.is_retryable(), expected, "{err:?}");
+            assert_eq!(
+                err.to_string()
+                    .starts_with("failed to invoke method OpenImage: "),
+                matches!(
+                    err,
+                    Error::RequestInitiationFailure { .. } | Error::RetryableRequestFailure { .. }
+                ),
+                "{err}"
+            );
+        }
+    }
+
+    /// The proxy classifies errors from a registry itself.
+    #[tokio::test]
+    async fn test_open_image_retryable() -> Result<()> {
+        if !check_skopeo() {
+            return Ok(());
+        }
+        let proxy = ImageProxy::new().await?;
+        if !proxy.supports_get_raw_blob() {
+            // Error codes came with the same protocol version as GetRawBlob
+            return Ok(());
+        }
+        // A port that nothing listens on, so connecting is refused
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let e = proxy
+            .open_image(&format!("docker://127.0.0.1:{port}/nonexistent:latest"))
+            .await
+            .unwrap_err();
+        assert!(e.is_retryable(), "{e:?}");
+        let td = tempfile::tempdir()?;
+        let td = td.path().to_str().unwrap();
+        let e = proxy
+            .open_image(&format!("oci:{td}/nonexistent:latest"))
+            .await
+            .unwrap_err();
+        assert!(!e.is_retryable(), "{e:?}");
         Ok(())
     }
 
