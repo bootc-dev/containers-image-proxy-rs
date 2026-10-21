@@ -353,6 +353,11 @@ fn raw_blob_proto_version() -> &'static semver::VersionReq {
     RAW_BLOB_PROTO_VERSION.get_or_init(|| semver::VersionReq::parse("0.2.8").unwrap())
 }
 
+fn varlink_socket_proto_version() -> &'static semver::VersionReq {
+    static VARLINK_SOCKET_PROTO_VERSION: OnceLock<semver::VersionReq> = OnceLock::new();
+    VARLINK_SOCKET_PROTO_VERSION.get_or_init(|| semver::VersionReq::parse("0.2.9").unwrap())
+}
+
 #[derive(Serialize)]
 struct Request {
     method: String,
@@ -690,6 +695,22 @@ impl FromReplyFds for FinishPipe {
     }
 }
 
+/// A single fd, with no pipeid and no need to call FinishPipe
+struct SingleFd(OwnedFd);
+
+impl FromReplyFds for SingleFd {
+    fn from_reply(fds: impl IntoIterator<Item = OwnedFd>, pipeid: u32) -> Result<Self> {
+        if pipeid != 0 {
+            return Err(Error::Other("Unexpected pipeid with a single fd".into()));
+        }
+        let fd = fds
+            .into_iter()
+            .exactly_one()
+            .map_err(|_| Error::Other("Expected exactly one fd".into()))?;
+        Ok(Self(fd))
+    }
+}
+
 /// A DualFds instance
 impl FromReplyFds for DualFds {
     fn from_reply(fds: impl IntoIterator<Item = OwnedFd>, pipeid: u32) -> Result<Self> {
@@ -762,6 +783,10 @@ impl ImageProxy {
 
     pub fn supports_get_raw_blob(&self) -> bool {
         raw_blob_proto_version().matches(&self.protover)
+    }
+
+    pub fn supports_open_varlink_socket(&self) -> bool {
+        varlink_socket_proto_version().matches(&self.protover)
     }
 
     /// Create and send a request. Should only be used by impl_request.
@@ -1117,6 +1142,37 @@ impl ImageProxy {
         Ok(Some(layers))
     }
 
+    /// Open a [varlink] connection to the proxy for the given image.
+    ///
+    /// The returned socket is a connected `SOCK_STREAM` Unix socket whose peer
+    /// is served by the proxy process.  It speaks the `org.composefs.Oci`
+    /// varlink interface, which allows transferring the layers of the image by
+    /// position, passing file descriptors for content that is already on disk
+    /// (see `splitfdstream`) instead of copying it through the proxy.
+    ///
+    /// This library does not itself speak varlink; wrap the returned fd with
+    /// the varlink client of your choice.  The connection is only usable while
+    /// this [`ImageProxy`] and the image remain open.
+    ///
+    /// Requires protocol version 0.2.9; see [`Self::supports_open_varlink_socket`].
+    ///
+    /// [varlink]: https://varlink.org/
+    #[instrument]
+    pub async fn open_varlink_socket(&self, img: &OpenedImage) -> Result<OwnedFd> {
+        let supported = varlink_socket_proto_version();
+        if !supported.matches(&self.protover) {
+            return Err(Error::ProxyTooOld {
+                requested_version: supported.to_string().into(),
+                found_version: self.protover.to_string().into(),
+            });
+        }
+        tracing::debug!("opening varlink socket");
+        let ((), SingleFd(fd)) = self
+            .impl_request_with_fds("OpenVarlinkSocket", [img.0])
+            .await?;
+        Ok(fd)
+    }
+
     /// Close the connection and wait for the child process to exit successfully.
     #[instrument]
     pub async fn finalize(self) -> Result<()> {
@@ -1147,7 +1203,7 @@ impl ImageProxy {
 #[cfg(test)]
 mod tests {
     use std::io::{BufWriter, Seek, Write};
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
     use super::*;
     use cap_std_ext::cap_std::fs::Dir;
@@ -1647,6 +1703,159 @@ mod tests {
                 assert_eq!(msg.as_ref(), "Expected exactly one fd for FinishPipe")
             }
             Err(other) => unreachable!("{other}"),
+        }
+    }
+
+    #[test]
+    fn test_single_fd() {
+        let fd = create_dummy_fd();
+        let raw = fd.as_raw_fd();
+        let SingleFd(fd) = SingleFd::from_reply(vec![fd], 0).unwrap();
+        assert_eq!(fd.as_raw_fd(), raw);
+    }
+
+    #[test]
+    fn test_single_fd_errors() {
+        // (number of fds, pipeid, expected message)
+        for (nfds, pipeid, expected) in [
+            (0, 0, "Expected exactly one fd"),
+            (2, 0, "Expected exactly one fd"),
+            (1, 1, "Unexpected pipeid with a single fd"),
+        ] {
+            let fds: Vec<OwnedFd> = (0..nfds).map(|_| create_dummy_fd()).collect();
+            match SingleFd::from_reply(fds, pipeid) {
+                Ok(_) => unreachable!("{nfds} fds, pipeid {pipeid}"),
+                Err(Error::Other(msg)) => assert_eq!(msg.as_ref(), expected),
+                Err(other) => unreachable!("{other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_varlink_socket_proto_version() {
+        let req = varlink_socket_proto_version();
+        assert!(!req.matches(&semver::Version::new(0, 2, 8)));
+        assert!(req.matches(&semver::Version::new(0, 2, 9)));
+        assert!(req.matches(&semver::Version::new(0, 2, 10)));
+    }
+
+    /// Start a fake proxy speaking `protover`.  `open_varlink_socket` is
+    /// answered with the descriptors returned by `varlink_fds`; any other
+    /// method gets an empty successful reply.  The server thread exits when
+    /// the returned proxy is dropped.
+    fn mock_proxy(
+        protover: semver::Version,
+        varlink_fds: impl Fn() -> Vec<OwnedFd> + Send + 'static,
+    ) -> ImageProxy {
+        let (mysock, theirsock) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::SEQPACKET,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _done_tx = done_tx;
+            let mut buf = [0u8; MAX_MSG_SIZE];
+            loop {
+                let n = rustix::net::recv(&theirsock, &mut buf, rustix::net::RecvFlags::empty())
+                    .map(|(n, _)| n)
+                    .unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+                let fds = match req["method"].as_str().unwrap() {
+                    "OpenVarlinkSocket" => varlink_fds(),
+                    _ => vec![],
+                };
+                let reply = br#"{"success":true,"error":"","pipeid":0,"value":null}"#;
+                let borrowed: Vec<_> = fds.iter().map(|f| f.as_fd()).collect();
+                let mut space = vec![
+                    std::mem::MaybeUninit::uninit();
+                    if borrowed.is_empty() {
+                        0
+                    } else {
+                        rustix::cmsg_space!(ScmRights(4))
+                    }
+                ];
+                let mut cmsg = rustix::net::SendAncillaryBuffer::new(&mut space);
+                if !borrowed.is_empty() {
+                    assert!(cmsg.push(rustix::net::SendAncillaryMessage::ScmRights(&borrowed)));
+                }
+                rustix::net::sendmsg(
+                    &theirsock,
+                    &[std::io::IoSlice::new(reply)],
+                    &mut cmsg,
+                    rustix::net::SendFlags::empty(),
+                )
+                .unwrap();
+            }
+        });
+        // Stands in for the child process: finishes once the server is gone.
+        let childwait = tokio::task::spawn_blocking(move || {
+            let _ = done_rx.recv();
+            Ok(std::process::Output {
+                status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                stdout: vec![],
+                stderr: vec![],
+            })
+        });
+        ImageProxy {
+            sockfd: Arc::new(Mutex::new(mysock)),
+            childwait: Arc::new(AsyncMutex::new(Box::pin(childwait))),
+            protover,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_varlink_socket() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let proxy = mock_proxy(semver::Version::new(0, 2, 9), || {
+            let (server, client) = UnixStream::pair().unwrap();
+            (&server).write_all(b"hello").unwrap();
+            vec![client.into()]
+        });
+        assert!(proxy.supports_open_varlink_socket());
+        let fd = proxy.open_varlink_socket(&OpenedImage(1)).await?;
+        let mut buf = [0u8; 5];
+        UnixStream::from(fd).read_exact(&mut buf)?;
+        assert_eq!(&buf, b"hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_open_varlink_socket_too_old() {
+        let proxy = mock_proxy(semver::Version::new(0, 2, 8), || {
+            unreachable!("no request must be sent to a proxy that is too old")
+        });
+        assert!(!proxy.supports_open_varlink_socket());
+        match proxy.open_varlink_socket(&OpenedImage(1)).await {
+            Err(Error::ProxyTooOld {
+                requested_version,
+                found_version,
+            }) => {
+                assert_eq!(requested_version.as_ref(), "^0.2.9");
+                assert_eq!(found_version.as_ref(), "0.2.8");
+            }
+            other => panic!("Unexpected result {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_varlink_socket_bad_reply() {
+        // A reply without a descriptor, or with more than one, is rejected.
+        for nfds in [0, 2] {
+            let proxy = mock_proxy(semver::Version::new(0, 2, 9), move || {
+                (0..nfds).map(|_| create_dummy_fd()).collect()
+            });
+            match proxy.open_varlink_socket(&OpenedImage(1)).await {
+                Err(Error::Other(msg)) => assert_eq!(msg.as_ref(), "Expected exactly one fd"),
+                other => panic!("Unexpected result for {nfds} fds: {other:?}"),
+            }
         }
     }
 
