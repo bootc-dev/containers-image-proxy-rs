@@ -68,7 +68,7 @@ struct Metadata {
 }
 
 impl CommonOpts {
-    fn to_config(self) -> ImageProxyConfig {
+    fn into_config(self) -> ImageProxyConfig {
         let mut r = ImageProxyConfig::default();
         if self.debug {
             r.debug = true;
@@ -81,7 +81,7 @@ impl CommonOpts {
 }
 
 async fn get_metadata(o: GetMetadataOpts) -> Result<()> {
-    let config = o.common.to_config();
+    let config = o.common.into_config();
     let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
     let img = proxy.open_image(&o.reference).await?;
     let (digest, manifest) = proxy.fetch_manifest(&img).await?;
@@ -91,7 +91,7 @@ async fn get_metadata(o: GetMetadataOpts) -> Result<()> {
 }
 
 async fn get_blob(o: GetBlobOpts) -> Result<()> {
-    let config = o.common.to_config();
+    let config = o.common.into_config();
     let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
     let img = proxy.open_image(&o.reference).await?;
     let (mut blob, driver) = proxy.get_blob(&img, &o.digest, o.size).await?;
@@ -115,7 +115,7 @@ async fn get_blob(o: GetBlobOpts) -> Result<()> {
 }
 
 async fn get_blob_raw(o: GetBlobOpts) -> Result<()> {
-    let config = o.common.to_config();
+    let config = o.common.into_config();
     let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
     let img = proxy.open_image(&o.reference).await?;
     let (_, mut datafd, err) = proxy.get_raw_blob(&img, &o.digest).await?;
@@ -139,7 +139,7 @@ async fn get_blob_raw(o: GetBlobOpts) -> Result<()> {
 }
 
 async fn fetch_container_to_devnull(o: FetchContainerToDevNullOpts) -> Result<()> {
-    let config = o.metaopts.common.to_config();
+    let config = o.metaopts.common.into_config();
     let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
     let img = &proxy.open_image(&o.metaopts.reference).await?;
     let manifest = proxy.fetch_manifest(img).await?.1;

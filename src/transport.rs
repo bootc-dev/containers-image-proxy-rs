@@ -92,13 +92,13 @@ impl TryFrom<&str> for Transport {
                 if rest.starts_with("://") {
                     Transport::Registry
                 } else {
-                    return Err(
-                        TransportConversionError::MissingDockerSlashes(imgref.into()).into(),
-                    );
+                    return Err(TransportConversionError::MissingDockerSlashes(
+                        imgref.into(),
+                    ));
                 }
             }
             prefix => {
-                return Err(TransportConversionError::InvalidTransport(prefix.into()).into());
+                return Err(TransportConversionError::InvalidTransport(prefix.into()));
             }
         };
 
